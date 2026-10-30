@@ -4,6 +4,7 @@ from typing import Any
 
 from browser_use.dom.serializer.clickable_elements import ClickableElementDetector
 from browser_use.dom.serializer.paint_order import PaintOrderRemover
+from browser_use.dom.serializer.table_headers import MAX_TABLE_HEADERS_TEXT_LENGTH, annotate_table_headers
 from browser_use.dom.utils import cap_text_length
 from browser_use.dom.views import (
 	DOMRect,
@@ -158,6 +159,13 @@ class DOMTreeSerializer:
 		self._assign_interactive_indices_and_mark_new_nodes(filtered_tree)
 		end_step4 = time.time()
 		self.timing_info['assign_interactive_indices'] = end_step4 - start_step4
+
+		# Step 5: Attach row/column header text to interactive elements inside
+		# native HTML table cells (parameter matrices keep their row/col context)
+		start_step5 = time.time()
+		annotate_table_headers(self.root_node, filtered_tree)
+		end_step5 = time.time()
+		self.timing_info['annotate_table_headers'] = end_step5 - start_step5
 
 		end_total = time.time()
 		self.timing_info['serialize_accessible_elements_total'] = end_total - start_total
@@ -1098,6 +1106,15 @@ class DOMTreeSerializer:
 							attributes_html_str += f' {compound_attr}'
 						else:
 							attributes_html_str = compound_attr
+
+				# Attach associated table row/column header text for interactive
+				# controls living inside native HTML table cells.
+				if node.table_headers:
+					table_headers_attr = f'table_headers={cap_text_length(node.table_headers, MAX_TABLE_HEADERS_TEXT_LENGTH)}'
+					if attributes_html_str:
+						attributes_html_str += f' {table_headers_attr}'
+					else:
+						attributes_html_str = table_headers_attr
 
 				# Build the line with shadow host indicator
 				shadow_prefix = ''

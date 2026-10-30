@@ -230,6 +230,7 @@ class SimplifiedNode:
 	excluded_by_parent: bool = False  # New field for bbox filtering
 	is_shadow_host: bool = False  # New field for shadow DOM hosts
 	is_compound_component: bool = False  # True for virtual components of compound controls
+	table_headers: str | None = None  # Row/column header text for an interactive element inside a table cell
 
 	def _clean_original_node_json(self, node_json: dict) -> dict:
 		"""Recursively remove children_nodes and shadow_roots from original_node JSON."""
