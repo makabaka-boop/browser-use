@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>Image Maps Test</title>
+	<style>
+		body {
+			margin: 0;
+		}
+		/* Main diagram renders at its natural pixel size (spec-intended case in which
+		   browsers natively hit-test rect, circle and poly areas). */
+		#main-image {
+			display: block;
+			width: 300px;
+			height: 200px;
+		}
+		/* This 100x100 image is rendered at 2x. Browsers natively scale RECT area
+		   hit regions with the image, but circle/poly coordinates are compared in
+		   unscaled coordinates (a long-standing browser quirk). */
+		#scaled-image {
+			display: block;
+			width: 200px;
+			height: 200px;
+		}
+		#hidden-image {
+			display: none;
+		}
+		.spacer {
+			height: 1000px;
+		}
+	</style>
+</head>
+<body>
+	<h1>Image maps</h1>
+	<a id="plain-link" href="#plain-anchor">Plain link outside the map</a>
+
+	<script>
+		// Capture-phase recorder of real mouse presses and the element they hit.
+		window.__mouseDowns = [];
+		document.addEventListener(
+			'mousedown',
+			function (event) {
+				var target = event.target;
+				window.__mouseDowns.push({
+					x: event.clientX,
+					y: event.clientY,
+					pageX: event.pageX,
+					pageY: event.pageY,
+					tag: target ? target.tagName : null,
+					label: target && target.getAttribute ? target.getAttribute('alt') || target.getAttribute('title') : null,
+				});
+			},
+			true
+		);
+	</script>
+
+	<div class="spacer"></div>
+
+	<img id="main-image" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='300'%20height='200'%20viewBox='0%200%20300%20200'%3E%3Crect%20width='300'%20height='200'%20fill='%23bde0fe'/%3E%3Crect%20x='0'%20y='0'%20width='100'%20height='100'%20fill='%23ffafcc'/%3E%3Ccircle%20cx='200'%20cy='50'%20r='40'%20fill='%23a2d2ff'/%3E%3Cpolygon%20points='150,200%20200,120%20250,200'%20fill='%23b9fbc0'/%3E%3C/svg%3E" usemap="#main-map" alt="Architecture diagram">
+	<map name="main-map">
+		<area shape="rect" coords="0,0,100,100" alt="Rect region" href="#rect-anchor">
+		<area shape="circle" coords="200,50,40" title="Circle region" href="#circle-anchor">
+		<area shape="poly" coords="150,200,200,120,250,200" alt="Polygon region" href="#poly-anchor" onclick="window.__polyClicks=(window.__polyClicks||0)+1; return false;">
+		<area shape="rect" coords="oops,1,2,3" alt="Malformed region" href="#malformed-anchor">
+		<area shape="poly" coords="0,0,5,5" alt="Two point region" href="#twopoint-anchor">
+		<area shape="rect" coords="10,10,10,10" alt="Zero region" href="#zero-anchor">
+		<area shape="default" alt="Default region" href="#default-anchor">
+		<area alt="No link region">
+	</map>
+
+	<img id="scaled-image" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='100'%20height='100'%3E%3Crect%20width='100'%20height='100'%20fill='%23e0e0e0'/%3E%3Crect%20x='0'%20y='0'%20width='50'%20height='50'%20fill='%23ffafcc'/%3E%3Ccircle%20cx='75'%20cy='25'%20r='15'%20fill='%23a2d2ff'/%3E%3C/svg%3E" usemap="#scaled-map" alt="Scaled diagram">
+	<map name="scaled-map">
+		<area shape="rect" coords="0,0,50,50" alt="Scaled rect region" href="#scaled-rect-anchor">
+		<area shape="circle" coords="75,25,15" title="Scaled circle region" href="#scaled-circle-anchor">
+	</map>
+
+	<img id="hidden-image" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='10'%20height='10'%3E%3C/svg%3E" usemap="#hidden-map" alt="Hidden diagram">
+	<map name="hidden-map">
+		<area shape="rect" coords="0,0,10,10" alt="Hidden region" href="#hidden-anchor">
+	</map>
+
+	<img id="excluded-image" data-browser-use-exclude="true" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='10'%20height='10'%3E%3C/svg%3E" usemap="#excluded-map" alt="Excluded diagram">
+	<map name="excluded-map">
+		<area shape="rect" coords="0,0,10,10" alt="Excluded region" href="#excluded-anchor">
+	</map>
+
+	<div class="spacer" style="height:1500px"></div>
+	<h2 id="plain-anchor">Plain link target</h2>
+	<h2 id="rect-anchor">Rect target</h2>
+	<h2 id="circle-anchor">Circle target</h2>
+	<h2 id="poly-anchor">Poly target</h2>
+	<h2 id="scaled-rect-anchor">Scaled rect target</h2>
+	<h2 id="scaled-circle-anchor">Scaled circle target</h2>
+</body>
+</html>

@@ -359,6 +359,25 @@ class EnhancedSnapshotNode:
 	"""Live checked state of a checkbox or radio input (DOMSnapshot inputChecked)."""
 
 
+@dataclass(slots=True, frozen=True)
+class ImageMapHotspot:
+	"""Metadata for one clickable hotspot of an HTML image map (<img usemap> + <map><area>).
+
+	The coordinates are stored in the image's intrinsic (natural) pixel coordinate
+	system, exactly as authored in the area's ``coords`` attribute. They are only
+	converted to viewport coordinates at click time, using the image's live
+	getBoundingClientRect() and naturalWidth/naturalHeight, so scroll and layout
+	changes are always respected.
+	"""
+
+	image_backend_node_id: int
+	"""CDP backendNodeId of the <img> that references the map (needed for live geometry at click time)."""
+	shape: str
+	"""Normalized hotspot shape: ``'rect'``, ``'circle'`` or ``'poly'``."""
+	coords: tuple[float, ...]
+	"""Raw area coordinates in the image's natural pixel space (validated at serialization time)."""
+
+
 # @dataclass(slots=True)
 # class SuperSelector:
 # 	node_id: int
@@ -469,6 +488,13 @@ class EnhancedDOMTreeNode:
 
 	uuid: str = field(default_factory=uuid7str)
 
+	image_map_hotspot: 'ImageMapHotspot | None' = None
+	"""
+	Set when this (synthetic) node represents one clickable <area> of an HTML image map
+	(<img usemap="#..."> + <map><area href="...">). The node itself mirrors the area
+	element while its geometry follows the referencing image.
+	"""
+
 	@property
 	def parent(self) -> 'EnhancedDOMTreeNode | None':
 		return self.parent_node
@@ -559,6 +585,7 @@ class EnhancedDOMTreeNode:
 			'shadow_root_type': self.shadow_root_type,
 			'ax_node': asdict(self.ax_node) if self.ax_node else None,
 			'snapshot_node': asdict(self.snapshot_node) if self.snapshot_node else None,
+			'image_map_hotspot': asdict(self.image_map_hotspot) if self.image_map_hotspot else None,
 			# these two in the end, so it's easier to read json
 			'shadow_roots': [r.__json__() for r in self.shadow_roots] if self.shadow_roots else [],
 			'children_nodes': [c.__json__() for c in self.children_nodes] if self.children_nodes else [],

@@ -39,6 +39,217 @@ ScrollEvent.model_rebuild()
 UploadFileEvent.model_rebuild()
 
 
+# Runs in the page with `this` bound to the <area> and the referencing <img> passed as
+# argument. Validates the live state, converts the area's natural-pixel coords to the
+# image's CURRENT viewport position, and returns a hittable point strictly inside the
+# hotspot (and not claimed by an earlier overlapping area). Never navigates on its own.
+# Token __SESSION_EXCLUDE_ATTR__ is replaced with the session-specific exclude attribute.
+_IMAGE_MAP_HOTSPOT_POINT_JS = """
+function(imgEl) {
+	var fail = function(code) { return { error: code }; };
+	try {
+		var area = this;
+		if (!area || area.nodeName !== 'AREA') return fail('area_invalid');
+		if (!area.hasAttribute('href') || !(area.getAttribute('href') || '').length) return fail('area_missing_href');
+		if (!imgEl || imgEl.nodeName !== 'IMG') return fail('image_invalid');
+		if (!area.isConnected || !imgEl.isConnected) return fail('detached');
+		if (area.getAttribute('data-browser-use-exclude') === 'true') return fail('area_excluded');
+		if (area.getAttribute('__SESSION_EXCLUDE_ATTR__') === 'true') return fail('area_excluded');
+
+		var useRefRaw = (imgEl.getAttribute('usemap') || '').trim();
+		if (useRefRaw.charAt(0) !== '#') return fail('map_unlinked');
+		var useRef = useRefRaw.slice(1).trim();
+		var mapEl = area.parentElement;
+		while (mapEl && mapEl.nodeName !== 'MAP') mapEl = mapEl.parentElement;
+		if (!mapEl || !useRef) return fail('map_unlinked');
+		if ((mapEl.getAttribute('name') || '') !== useRef && mapEl.id !== useRef) return fail('map_unlinked');
+
+		if (!imgEl.complete || !(imgEl.naturalWidth > 0) || !(imgEl.naturalHeight > 0)) return fail('image_not_loaded');
+		var rect = { width: 0, height: 0, left: 0, top: 0, right: 0, bottom: 0 };
+		var sx = 1, sy = 1;
+		var toX = function(nx) { return rect.left + nx * sx; };
+		var toY = function(ny) { return rect.top + ny * sy; };
+		var SHAPE_ALIASES = { rectangle: 'rect', rect: 'rect', circle: 'circle', circ: 'circle', polygon: 'poly', poly: 'poly' };
+
+		var parseCoords = function(raw) {
+			if (raw == null) return null;
+			var tokens = raw.split(','), nums = [];
+			for (var i = 0; i < tokens.length; i++) {
+				var token = tokens[i].trim();
+				if (!token) return null;
+				var n = Number(token);
+				if (!isFinite(n)) return null;
+				nums.push(n);
+			}
+			return nums;
+		};
+
+		var buildRegion = function(areaEl) {
+			if (!areaEl.hasAttribute('href') || !(areaEl.getAttribute('href') || '').length) return null;
+			if (areaEl.hasAttribute('nohref')) return null;
+			var shape = SHAPE_ALIASES[(areaEl.getAttribute('shape') || '').trim().toLowerCase() || 'rect'];
+			if (!shape) return null;
+			var nums = parseCoords(areaEl.getAttribute('coords'));
+			if (!nums) return null;
+			if (shape === 'rect') {
+				if (nums.length < 4) return null;
+				var l = Math.min(nums[0], nums[2]), r = Math.max(nums[0], nums[2]);
+				var t = Math.min(nums[1], nums[3]), b = Math.max(nums[1], nums[3]);
+				if (r <= l || b <= t) return null;
+				return { kind: 'rect', x1: toX(l), y1: toY(t), x2: toX(r), y2: toY(b) };
+			}
+			if (shape === 'circle') {
+				if (nums.length < 3 || !(nums[2] > 0)) return null;
+				return { kind: 'circle', cx: toX(nums[0]), cy: toY(nums[1]), rx: nums[2] * sx, ry: nums[2] * sy };
+			}
+			var points = [];
+			var lim = nums.length - (nums.length % 2);
+			for (var j = 0; j < lim; j += 2) points.push([toX(nums[j]), toY(nums[j + 1])]);
+			if (points.length < 3) return null;
+			return { kind: 'poly', points: points };
+		};
+
+		// All areas preceding this one in the map; browser hit-testing activates the
+		// first area (tree order) covering a point.
+		var mapAreas = mapEl.querySelectorAll('area');
+
+		var region, blockerRegions, box;
+		var isImageHidden = function() {
+			var c = window.getComputedStyle(imgEl);
+			if (c.display === 'none' || c.visibility === 'hidden' || c.visibility === 'collapse') return true;
+			return parseFloat(c.opacity) === 0;
+		};
+		var rebuildGeometry = function() {
+			rect = imgEl.getBoundingClientRect();
+			if (!(rect.width > 0) || !(rect.height > 0)) return false;
+			sx = rect.width / imgEl.naturalWidth;
+			sy = rect.height / imgEl.naturalHeight;
+			region = buildRegion(area);
+			if (!region) return false;
+			blockerRegions = [];
+			for (var ai = 0; ai < mapAreas.length; ai++) {
+				if (mapAreas[ai] === area) break;
+				var blocker = buildRegion(mapAreas[ai]);
+				if (blocker) blockerRegions.push(blocker);
+			}
+			if (region.kind === 'rect') {
+				box = { x1: region.x1, y1: region.y1, x2: region.x2, y2: region.y2 };
+			} else if (region.kind === 'circle') {
+				box = { x1: region.cx - region.rx, y1: region.cy - region.ry, x2: region.cx + region.rx, y2: region.cy + region.ry };
+			} else {
+				var pxs = region.points.map(function(p) { return p[0]; });
+				var pys = region.points.map(function(p) { return p[1]; });
+				box = { x1: Math.min.apply(null, pxs), y1: Math.min.apply(null, pys), x2: Math.max.apply(null, pxs), y2: Math.max.apply(null, pys) };
+			}
+			return true;
+		};
+		if (isImageHidden()) return fail('image_hidden');
+		if (!rebuildGeometry()) return fail('invalid_coords');
+
+		var contains = function(reg, x, y) {
+			if (reg.kind === 'rect') return x >= reg.x1 && x <= reg.x2 && y >= reg.y1 && y <= reg.y2;
+			if (reg.kind === 'circle') {
+				var dx = (x - reg.cx) / reg.rx, dy = (y - reg.cy) / reg.ry;
+				return dx * dx + dy * dy <= 1;
+			}
+			var inside = false, pts = reg.points;
+			for (var ii = 0, jj = pts.length - 1; ii < pts.length; jj = ii++) {
+				var xi = pts[ii][0], yi = pts[ii][1], xj = pts[jj][0], yj = pts[jj][1];
+				if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+			}
+			return inside;
+		};
+
+		// scrollIntoViewIfNeeded only reveals the image box; a hotspot near the image
+		// edge can stay outside the viewport. Center the hotspot box explicitly.
+		var viewW = window.innerWidth, viewH = window.innerHeight;
+		if (box.x1 < 0 || box.y1 < 0 || box.x2 > viewW || box.y2 > viewH) {
+			var targetScrollX = window.scrollX + (box.x1 + box.x2) / 2 - viewW / 2;
+			var targetScrollY = window.scrollY + (box.y1 + box.y2) / 2 - viewH / 2;
+			window.scrollTo(Math.max(0, targetScrollX), Math.max(0, targetScrollY));
+			if (!rebuildGeometry()) {
+				if (isImageHidden()) return fail('image_hidden');
+				return fail('invalid_coords');
+			}
+		}
+
+		if (isImageHidden()) return fail('image_hidden');
+
+		// Preferred points: region center landmarks.
+		var preferred;
+		if (region.kind === 'circle') preferred = { x: region.cx, y: region.cy };
+		else if (region.kind === 'rect') preferred = { x: (box.x1 + box.x2) / 2, y: (box.y1 + box.y2) / 2 };
+		else {
+			var sumX = 0, sumY = 0;
+			for (var pi = 0; pi < region.points.length; pi++) { sumX += region.points[pi][0]; sumY += region.points[pi][1]; }
+			preferred = { x: sumX / region.points.length, y: sumY / region.points.length };
+		}
+
+		// Intersect the hotspot box with the visible image and the current viewport.
+		var minX = Math.max(box.x1, rect.left, 0) + 0.5;
+		var minY = Math.max(box.y1, rect.top, 0) + 0.5;
+		var maxX = Math.min(box.x2, rect.right, window.innerWidth) - 0.5;
+		var maxY = Math.min(box.y2, rect.bottom, window.innerHeight) - 0.5;
+		if (!(maxX > minX) || !(maxY > minY)) return fail('no_hittable_point');
+
+		var hittable = function(x, y) {
+			if (x < minX || x > maxX || y < minY || y > maxY) return false;
+			if (!contains(region, x, y)) return false;
+			for (var bi = 0; bi < blockerRegions.length; bi++) {
+				if (contains(blockerRegions[bi], x, y)) return false;
+			}
+			// Every candidate is geometrically inside this area's region, so the browser
+			// MUST resolve the hit to this exact <area>: image maps make the area the
+			// hit-test target over mapped pixels. An IMG result means the browser's own
+			// region does not cover this point (e.g. it does not scale circle/poly
+			// regions with the image) - the native behavior cannot be triggered here.
+			// A different area result means an earlier overlapping area wins the hit.
+			return document.elementFromPoint(x, y) === area;
+		};
+
+		var candidates = [preferred];
+		var w = maxX - minX, h = maxY - minY;
+		var midX = (minX + maxX) / 2, midY = (minY + maxY) / 2;
+		var offsets = [[0.25,-0.25],[-0.25,0.25],[0.25,0.25],[-0.25,-0.25],[0.3,0],[-0.3,0],[0,0.3],[0,-0.3],[0.1,0.1]];
+		for (var oi = 0; oi < offsets.length; oi++) {
+			candidates.push({ x: midX + offsets[oi][0] * w, y: midY + offsets[oi][1] * h });
+		}
+		var stepX = Math.max(6, w / 8), stepY = Math.max(6, h / 8);
+		for (var gx = minX; gx <= maxX; gx += stepX) {
+			for (var gy = minY; gy <= maxY; gy += stepY) candidates.push({ x: gx, y: gy });
+		}
+
+		for (var ci = 0; ci < candidates.length; ci++) {
+			if (hittable(candidates[ci].x, candidates[ci].y)) return { x: candidates[ci].x, y: candidates[ci].y };
+		}
+		return fail('no_hittable_point');
+	} catch (e) {
+		return fail('js_error');
+	}
+}
+"""
+
+# Human-readable failure reasons for image-map hotspot clicks.
+_IMAGE_MAP_HOTSPOT_ERRORS = {
+	'area_invalid': 'the target is no longer an image-map <area> element',
+	'area_missing_href': 'the hotspot no longer has an href target',
+	'image_invalid': 'the referencing image element is gone',
+	'detached': 'the hotspot or its image was removed from the page',
+	'area_excluded': 'the hotspot was explicitly excluded from interaction',
+	'map_unlinked': "the area is no longer linked from the image's usemap",
+	'image_not_loaded': 'the image has not loaded (intrinsic size is zero)',
+	'image_not_rendered': 'the image is rendered with zero size',
+	'image_hidden': 'the image is hidden',
+	'unsupported_shape': 'the hotspot shape is not supported',
+	'invalid_coords': 'the hotspot coordinates are invalid',
+	'no_hittable_point': (
+		'no point of the hotspot is currently reachable in the viewport '
+		'(the region may be scrolled out of view, zero-sized, or covered by another element)'
+	),
+	'js_error': 'failed to evaluate the hotspot geometry on the page',
+}
+
+
 class DefaultActionWatchdog(BaseWatchdog):
 	"""Handles default browser actions like click, type, and scroll using CDP."""
 
@@ -347,6 +558,14 @@ class DefaultActionWatchdog(BaseWatchdog):
 			# Use the provided node
 			element_node = event.node
 			index_for_logging = self.browser_session.get_selector_index(element_node)
+
+			# Event dispatch validates the payload with Pydantic, which reconstructs the
+			# EnhancedDOMTreeNode dataclass and drops non-primitive fields such as the
+			# synthetic image-map hotspot metadata. Re-attach the cached rich node so the
+			# dedicated image-map click path can detect area hotspots.
+			cached_element = (self.browser_session._cached_selector_map or {}).get(index_for_logging)
+			if cached_element is not None and getattr(cached_element, 'image_map_hotspot', None) is not None:
+				element_node = cached_element
 
 			# Check if element is a file input (should not be clicked)
 			if self.browser_session.is_file_input(element_node):
@@ -700,6 +919,132 @@ class DefaultActionWatchdog(BaseWatchdog):
 			self.logger.debug(f'Occlusion check failed: {e}, assuming not occluded')
 			return False
 
+	async def _click_image_map_hotspot_impl(self, element_node) -> dict:
+		"""Click one image-map <area> hotspot with a real mouse event inside the region.
+
+		Geometry is computed from the image's CURRENT live layout (getBoundingClientRect +
+		naturalWidth/naturalHeight), so scrolling and relayouts are handled automatically.
+
+		Failure policy (required for image-map areas):
+		- any invalid/unreachable state returns an explicit ``validation_error``;
+		- never fall back to the image center;
+		- never call ``area.click()`` or open ``href`` directly from JavaScript.
+		"""
+		hotspot = element_node.image_map_hotspot
+		selector_index = self.browser_session.get_selector_index(element_node)
+		area_label = (element_node.attributes.get('alt') or element_node.attributes.get('title') or '').strip()
+		target_description = f'image-map hotspot [{selector_index}]' + (f' "{area_label}"' if area_label else '')
+
+		cdp_session = await self.browser_session.cdp_client_for_node(element_node)
+		session_id = cdp_session.session_id
+
+		# Resolve the live <area> and its <img> via CDP object ids.
+		try:
+			area_resolve = await cdp_session.cdp_client.send.DOM.resolveNode(
+				params={'backendNodeId': element_node.backend_node_id},
+				session_id=session_id,
+			)
+			area_object_id = area_resolve.get('object', {}).get('objectId')
+			img_resolve = await cdp_session.cdp_client.send.DOM.resolveNode(
+				params={'backendNodeId': hotspot.image_backend_node_id},
+				session_id=session_id,
+			)
+			img_object_id = img_resolve.get('object', {}).get('objectId')
+			if not area_object_id or not img_object_id:
+				raise RuntimeError('CDP did not return object ids for the area or its image')
+		except Exception as e:
+			msg = f'Cannot click {target_description}: the area or its image is no longer in the page ({e}).'
+			self.logger.info(msg)
+			return {'validation_error': msg}
+
+		# Scroll the image into view first; coordinates are measured afterwards.
+		try:
+			await cdp_session.cdp_client.send.DOM.scrollIntoViewIfNeeded(
+				params={'backendNodeId': hotspot.image_backend_node_id},
+				session_id=session_id,
+			)
+			await asyncio.sleep(0.05)
+		except Exception as e:
+			self.logger.debug(f'Image-map scrollIntoViewIfNeeded failed: {e}')
+
+		# Compute a hittable viewport point from the current page state.
+		function_declaration = _IMAGE_MAP_HOTSPOT_POINT_JS.replace(
+			'__SESSION_EXCLUDE_ATTR__', f'data-browser-use-exclude-{self.browser_session.id}'
+		)
+		try:
+			geometry_result = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+				params={
+					'functionDeclaration': function_declaration,
+					'objectId': area_object_id,
+					'arguments': [{'objectId': img_object_id}],
+					'returnByValue': True,
+				},
+				session_id=session_id,
+			)
+		except Exception as e:
+			msg = f'Cannot click {target_description}: failed to evaluate hotspot geometry ({e}).'
+			self.logger.warning(msg)
+			return {'validation_error': msg}
+
+		point = geometry_result.get('result', {}).get('value')
+		if not isinstance(point, dict) or ('x' not in point or 'y' not in point):
+			error_code = point.get('error') if isinstance(point, dict) else None
+			reason = _IMAGE_MAP_HOTSPOT_ERRORS.get(error_code or '', 'unexpected page state while locating the hotspot')
+			msg = f'Cannot click {target_description}: {reason}.'
+			self.logger.info(msg)
+			return {'validation_error': msg}
+
+		click_x, click_y = float(point['x']), float(point['y'])
+		self.logger.debug(f'🗺️ Clicking {target_description} at viewport coordinates ({click_x:.1f}, {click_y:.1f})')
+
+		# Dispatch REAL mouse events at the hotspot point. No JS-click fallback, ever.
+		try:
+			await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+				params={'type': 'mouseMoved', 'x': click_x, 'y': click_y},
+				session_id=session_id,
+			)
+			await asyncio.sleep(0.05)
+
+			try:
+				await asyncio.wait_for(
+					cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+						params={
+							'type': 'mousePressed',
+							'x': click_x,
+							'y': click_y,
+							'button': 'left',
+							'clickCount': 1,
+						},
+						session_id=session_id,
+					),
+					timeout=3.0,
+				)
+				await asyncio.sleep(0.08)
+			except TimeoutError:
+				self.logger.debug('⏱️ Hotspot mouse down timed out (likely a dialog), continuing...')
+
+			try:
+				await asyncio.wait_for(
+					cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+						params={
+							'type': 'mouseReleased',
+							'x': click_x,
+							'y': click_y,
+							'button': 'left',
+							'clickCount': 1,
+						},
+						session_id=session_id,
+					),
+					timeout=5.0,
+				)
+			except TimeoutError:
+				self.logger.debug('⏱️ Hotspot mouse up timed out, continuing...')
+		except Exception as e:
+			raise BrowserError(f'Failed to dispatch real mouse click for {target_description}: {e}') from e
+
+		self.logger.debug('🖱️ Image-map hotspot clicked successfully using x,y coordinates')
+		return {'click_x': click_x, 'click_y': click_y}
+
 	async def _click_element_node_impl(self, element_node) -> dict | None:
 		"""
 		Click an element using pure CDP with multiple fallback methods for getting element geometry.
@@ -709,6 +1054,11 @@ class DefaultActionWatchdog(BaseWatchdog):
 		"""
 
 		try:
+			# Image-map <area> hotspots have no rendered box of their own and require
+			# coordinate conversion from the referencing image's live layout.
+			if getattr(element_node, 'image_map_hotspot', None) is not None:
+				return await self._click_image_map_hotspot_impl(element_node)
+
 			# Check if element is a file input or select dropdown - these should not be clicked
 			tag_name = element_node.tag_name.lower() if element_node.tag_name else ''
 			element_type = element_node.attributes.get('type', '').lower() if element_node.attributes else ''

@@ -3,6 +3,7 @@
 from typing import Any
 
 from browser_use.dom.serializer.clickable_elements import ClickableElementDetector
+from browser_use.dom.serializer.image_maps import build_hotspot_nodes_for_image, collect_main_document_maps
 from browser_use.dom.serializer.paint_order import PaintOrderRemover
 from browser_use.dom.utils import cap_text_length
 from browser_use.dom.views import (
@@ -94,6 +95,8 @@ class DOMTreeSerializer:
 		self.paint_order_filtering = paint_order_filtering
 		# Session ID for session-specific exclude attribute
 		self.session_id = session_id
+		# Lazy index of main-document <map> elements keyed by name/id (for image-map areas)
+		self._main_document_maps: dict[str, EnhancedDOMTreeNode] | None = None
 
 	def _safe_parse_number(self, value_str: str, default: float) -> float:
 		"""Parse string to float, handling negatives and decimals."""
@@ -123,6 +126,7 @@ class DOMTreeSerializer:
 		self._clickable_cache = {}  # Clear cache for new serialization
 		self._reserved_backend_node_ids = set()
 		self._next_synthetic_index = 1
+		self._main_document_maps = None
 
 		# Step 1: Create simplified tree (includes clickable element detection)
 		start_step1 = time.time()
@@ -452,6 +456,20 @@ class DOMTreeSerializer:
 
 		return self._clickable_cache[cache_key]
 
+	def _inject_image_map_hotspots(self, simplified: SimplifiedNode, node: EnhancedDOMTreeNode) -> None:
+		"""Attach synthetic child nodes for the clickable areas of a visible main-document image map."""
+		if node.node_name != 'IMG' or not node.is_visible:
+			return
+		# Main document only: image maps inside iframes/shadow trees are out of scope.
+		if self.root_node.target_id is not None and node.target_id != self.root_node.target_id:
+			return
+
+		if self._main_document_maps is None:
+			self._main_document_maps = collect_main_document_maps(self.root_node, self.root_node.target_id)
+
+		for hotspot_node in build_hotspot_nodes_for_image(node, self._main_document_maps, self.session_id):
+			simplified.children.append(SimplifiedNode(original_node=hotspot_node, children=[]))
+
 	def _create_simplified_tree(self, node: EnhancedDOMTreeNode, depth: int = 0) -> SimplifiedNode | None:
 		"""Step 1: Create a simplified tree with enhanced element detection."""
 
@@ -542,6 +560,9 @@ class DOMTreeSerializer:
 
 				# COMPOUND CONTROL PROCESSING: Add virtual components for compound controls
 				self._add_compound_components(simplified, node)
+
+				# IMAGE MAPS: attach clickable <area> hotspots of visible <img usemap> elements
+				self._inject_image_map_hotspots(simplified, node)
 
 				# SHADOW DOM SPECIAL CASE: Always include shadow hosts even if not visible
 				# Many SPA frameworks (React, Vue) render content in shadow DOM
@@ -651,7 +672,7 @@ class DOMTreeSerializer:
 		if backend_node_id not in self._selector_map:
 			return backend_node_id
 
-		while self._next_synthetic_index in self._reserved_backend_node_ids:
+		while self._next_synthetic_index in self._reserved_backend_node_ids or self._next_synthetic_index in self._selector_map:
 			self._next_synthetic_index += 1
 		selector_index = self._next_synthetic_index
 		self._next_synthetic_index += 1
@@ -664,106 +685,116 @@ class DOMTreeSerializer:
 
 		# Skip assigning index to excluded nodes, or ignored by paint order
 		if not node.excluded_by_parent and not node.ignored_by_paint_order:
-			# Regular interactive element assignment (including enhanced compound controls)
-			is_interactive_assign = self._is_interactive_cached(node.original_node)
-			is_visible = node.original_node.snapshot_node and node.original_node.is_visible
-			is_scrollable = node.original_node.is_actually_scrollable
-
-			# DIAGNOSTIC: Log when interactive elements don't have snapshot_node
-			if is_interactive_assign and not node.original_node.snapshot_node:
-				import logging
-
-				logger = logging.getLogger('browser_use.dom.serializer')
-				attrs = node.original_node.attributes or {}
-				attr_str = f'name={attrs.get("name", "")} id={attrs.get("id", "")} type={attrs.get("type", "")}'
-				in_shadow = self._is_inside_shadow_dom(node)
-				if (
-					in_shadow
-					and node.original_node.tag_name
-					and node.original_node.tag_name.lower() in ['input', 'button', 'select', 'textarea', 'a']
-				):
-					logger.debug(
-						f'🔍 INCLUDING shadow DOM <{node.original_node.tag_name}> (no snapshot_node but in shadow DOM): '
-						f'backendNodeId={node.original_node.backend_node_id} {attr_str}'
-					)
-				else:
-					logger.debug(
-						f'🔍 SKIPPING interactive <{node.original_node.tag_name}> (no snapshot_node, not in shadow DOM): '
-						f'backendNodeId={node.original_node.backend_node_id} {attr_str}'
-					)
-
-			# EXCEPTION: File inputs are often hidden with opacity:0 but are still functional
-			# Bootstrap and other frameworks use this pattern with custom-styled file pickers
-			is_file_input = (
-				node.original_node.tag_name
-				and node.original_node.tag_name.lower() == 'input'
-				and node.original_node.attributes
-				and node.original_node.attributes.get('type') == 'file'
-			)
-
-			# EXCEPTION: Shadow DOM form elements may not have snapshot layout data from CDP's
-			# DOMSnapshot.captureSnapshot, but they're still functional/interactive.
-			# This handles login forms, custom web components, etc. inside shadow DOM.
-			is_shadow_dom_element = (
-				is_interactive_assign
-				and not node.original_node.snapshot_node
-				and node.original_node.tag_name
-				and node.original_node.tag_name.lower() in ['input', 'button', 'select', 'textarea', 'a']
-				and self._is_inside_shadow_dom(node)
-			)
-
-			# Check if scrollable container should be made interactive
-			# For scrollable elements, ONLY make them interactive if they have no interactive descendants
-			should_make_interactive = False
-			if is_scrollable:
-				# Check if this is a dropdown container that needs to be indexed regardless of descendants
-				attrs = node.original_node.attributes or {}
-				role = attrs.get('role', '').lower()
-				tag_name = (node.original_node.tag_name or '').lower()
-				class_attr = attrs.get('class', '').lower()
-				class_list = class_attr.split() if class_attr else []
-
-				# Detect dropdown containers by role, tag, or class
-				is_dropdown_by_role = role in ('listbox', 'menu', 'combobox', 'menubar', 'tree', 'grid')
-				is_dropdown_by_tag = tag_name == 'select'
-				# Match common dropdown class patterns
-				is_dropdown_by_class = (
-					'dropdown' in class_list
-					or 'dropdown-menu' in class_list
-					or 'select-menu' in class_list
-					or ('ui' in class_list and 'dropdown' in class_attr)  # Semantic UI
-				)
-				is_dropdown_container = is_dropdown_by_role or is_dropdown_by_tag or is_dropdown_by_class
-
-				if is_dropdown_container:
-					# Always index dropdown containers - need to be targetable for select_dropdown
-					should_make_interactive = True
-				else:
-					# For other scrollable elements, check if they have interactive children
-					has_interactive_desc = self._has_interactive_descendants(node)
-					# Only make scrollable container interactive if it has no interactive descendants
-					if not has_interactive_desc:
-						should_make_interactive = True
-			elif is_interactive_assign and (is_visible or is_file_input or is_shadow_dom_element):
-				# Non-scrollable interactive elements: make interactive if visible (or file input or shadow DOM form element)
-				should_make_interactive = True
-
-			# Add to selector map if element should be interactive
-			if should_make_interactive:
-				# Mark node as interactive
+			if getattr(node.original_node, 'image_map_hotspot', None) is not None:
+				# Image-map <area>: synthetic interactive node whose visibility follows the image.
+				# Coordinates are revalidated against the live page at click time.
 				node.is_interactive = True
 				node.selector_index = self._allocate_selector_index(node.original_node.backend_node_id)
 				self._selector_map[node.selector_index] = node.original_node
 				self._interactive_counter += 1
+				# Areas are static parts of the page, don't flag them as newly appeared.
+				node.is_new = False
+			else:
+				# Regular interactive element assignment (including enhanced compound controls)
+				is_interactive_assign = self._is_interactive_cached(node.original_node)
+				is_visible = node.original_node.snapshot_node and node.original_node.is_visible
+				is_scrollable = node.original_node.is_actually_scrollable
 
-				# Mark compound components as new for visibility
-				if node.is_compound_component:
-					node.is_new = True
-				elif self._previous_node_ids:
-					# Check if node is new for regular elements
-					current_node_id = (str(node.original_node.session_id), node.original_node.backend_node_id)
-					if current_node_id not in self._previous_node_ids:
+				# DIAGNOSTIC: Log when interactive elements don't have snapshot_node
+				if is_interactive_assign and not node.original_node.snapshot_node:
+					import logging
+
+					logger = logging.getLogger('browser_use.dom.serializer')
+					attrs = node.original_node.attributes or {}
+					attr_str = f'name={attrs.get("name", "")} id={attrs.get("id", "")} type={attrs.get("type", "")}'
+					in_shadow = self._is_inside_shadow_dom(node)
+					if (
+						in_shadow
+						and node.original_node.tag_name
+						and node.original_node.tag_name.lower() in ['input', 'button', 'select', 'textarea', 'a']
+					):
+						logger.debug(
+							f'🔍 INCLUDING shadow DOM <{node.original_node.tag_name}> (no snapshot_node but in shadow DOM): '
+							f'backendNodeId={node.original_node.backend_node_id} {attr_str}'
+						)
+					else:
+						logger.debug(
+							f'🔍 SKIPPING interactive <{node.original_node.tag_name}> (no snapshot_node, not in shadow DOM): '
+							f'backendNodeId={node.original_node.backend_node_id} {attr_str}'
+						)
+
+				# EXCEPTION: File inputs are often hidden with opacity:0 but are still functional
+				# Bootstrap and other frameworks use this pattern with custom-styled file pickers
+				is_file_input = (
+					node.original_node.tag_name
+					and node.original_node.tag_name.lower() == 'input'
+					and node.original_node.attributes
+					and node.original_node.attributes.get('type') == 'file'
+				)
+
+				# EXCEPTION: Shadow DOM form elements may not have snapshot layout data from CDP's
+				# DOMSnapshot.captureSnapshot, but they're still functional/interactive.
+				# This handles login forms, custom web components, etc. inside shadow DOM.
+				is_shadow_dom_element = (
+					is_interactive_assign
+					and not node.original_node.snapshot_node
+					and node.original_node.tag_name
+					and node.original_node.tag_name.lower() in ['input', 'button', 'select', 'textarea', 'a']
+					and self._is_inside_shadow_dom(node)
+				)
+
+				# Check if scrollable container should be made interactive
+				# For scrollable elements, ONLY make them interactive if they have no interactive descendants
+				should_make_interactive = False
+				if is_scrollable:
+					# Check if this is a dropdown container that needs to be indexed regardless of descendants
+					attrs = node.original_node.attributes or {}
+					role = attrs.get('role', '').lower()
+					tag_name = (node.original_node.tag_name or '').lower()
+					class_attr = attrs.get('class', '').lower()
+					class_list = class_attr.split() if class_attr else []
+
+					# Detect dropdown containers by role, tag, or class
+					is_dropdown_by_role = role in ('listbox', 'menu', 'combobox', 'menubar', 'tree', 'grid')
+					is_dropdown_by_tag = tag_name == 'select'
+					# Match common dropdown class patterns
+					is_dropdown_by_class = (
+						'dropdown' in class_list
+						or 'dropdown-menu' in class_list
+						or 'select-menu' in class_list
+						or ('ui' in class_list and 'dropdown' in class_attr)  # Semantic UI
+					)
+					is_dropdown_container = is_dropdown_by_role or is_dropdown_by_tag or is_dropdown_by_class
+
+					if is_dropdown_container:
+						# Always index dropdown containers - need to be targetable for select_dropdown
+						should_make_interactive = True
+					else:
+						# For other scrollable elements, check if they have interactive children
+						has_interactive_desc = self._has_interactive_descendants(node)
+						# Only make scrollable container interactive if it has no interactive descendants
+						if not has_interactive_desc:
+							should_make_interactive = True
+				elif is_interactive_assign and (is_visible or is_file_input or is_shadow_dom_element):
+					# Non-scrollable interactive elements: make interactive if visible (or file input or shadow DOM form element)
+					should_make_interactive = True
+
+				# Add to selector map if element should be interactive
+				if should_make_interactive:
+					# Mark node as interactive
+					node.is_interactive = True
+					node.selector_index = self._allocate_selector_index(node.original_node.backend_node_id)
+					self._selector_map[node.selector_index] = node.original_node
+					self._interactive_counter += 1
+
+					# Mark compound components as new for visibility
+					if node.is_compound_component:
 						node.is_new = True
+					elif self._previous_node_ids:
+						# Check if node is new for regular elements
+						current_node_id = (str(node.original_node.session_id), node.original_node.backend_node_id)
+						if current_node_id not in self._previous_node_ids:
+							node.is_new = True
 
 		# Process children
 		for child in node.children:
@@ -830,6 +861,11 @@ class DOMTreeSerializer:
 
 		# Never exclude text nodes - we always want to preserve text content
 		if node.original_node.node_type == NodeType.TEXT_NODE:
+			return False
+
+		# Never exclude image-map hotspot areas: their bounds follow the image on
+		# purpose and they must remain independently clickable even inside a link.
+		if getattr(node.original_node, 'image_map_hotspot', None) is not None:
 			return False
 
 		# Get child bounds
